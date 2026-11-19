@@ -37,12 +37,23 @@ public enum SharedFolder {
         if !run("/bin/ls", ["-lde", folder]).output.contains("user:\(account) allow") {
             let me = NSUserName()
             for user in [account, me] {
-                let ace = "user:\(user) allow read,write,append,execute,delete,delete_child,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit"
-                let result = run("/bin/chmod", ["+a", ace, folder])
+                let result = run("/bin/chmod", ["+a", ace(for: user), folder])
                 guard result.status == 0 else { throw Failure("couldn't share \(folder): \(result.output)") }
             }
         }
         return folder
+    }
+
+    /// Full access for `user`, inherited by everything created inside.
+    static func ace(for user: String) -> String {
+        "user:\(user) allow read,write,append,execute,delete,delete_child,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit"
+    }
+
+    /// Gives the account the same access to a copy made elsewhere (and so not inheriting the folder's), before
+    /// it moves into the exchange folder. Links inside aren't followed.
+    public static func share(_ path: String, with account: String) throws {
+        let result = run("/bin/chmod", ["-R", "+a", ace(for: account), path])
+        guard result.status == 0 else { throw Failure("couldn't share \(path): \(result.output)") }
     }
 
     /// Your path with a leading ~ expanded to your home folder.

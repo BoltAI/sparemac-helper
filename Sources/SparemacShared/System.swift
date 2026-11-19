@@ -10,14 +10,45 @@ public enum Sparemac {
     /// The one agent account Sparemac sets up.
     public static let defaultAccount = "agent"
 
-    /// Where the helper installs SparemacAgent for every session (root-owned).
+    /// Root-owned: the owner's uid (who Sparemac Tools answers), the socket folders and the optional firewall.
     public static let supportDirectory = "/Library/Application Support/Sparemac"
     public static let ownerFile = "\(supportDirectory)/owner-uid"
+    /// Sparemac Tools' bundle: its file name is the name Privacy & Security lists it by.
+    public static let agentBundleName = "Sparemac Tools.app"
     public static let agentLaunchAgent = "/Library/LaunchAgents/\(agentLabel).plist"
-    /// The root helper is an app bundle, so it shows by name in Privacy & Security (Full Disk Access).
-    public static let helperApp = "/Library/PrivilegedHelperTools/Sparemac Helper.app"
-    public static let helperExecutable = "\(helperApp)/Contents/MacOS/SparemacHelper"
-    public static let helperPlist = "/Library/LaunchDaemons/\(helperLabel).plist"
+    /// Sparemac Tools inside an app bundle.
+    public static func agentApp(in app: URL) -> URL { app.appendingPathComponent("Contents/Resources/\(agentBundleName)") }
+    /// Where sessions run Sparemac Tools from: a copy outside Sparemac.app (macOS would grant its permissions to
+    /// Sparemac itself, the app around it, which runs in your account), in a folder you own, so Sparemac keeps it
+    /// up to date with no password. Sessions can read it, not change it.
+    public static let agentToolsDirectory = "/Users/Shared/Sparemac/Tools"
+    public static let agentApp = "\(agentToolsDirectory)/\(agentBundleName)"
+    public static let agentExecutable = "\(agentApp)/Contents/MacOS/SparemacAgent"
+
+    /// The admin tool: run only after you type your password, for that one change, then it exits. An app
+    /// bundle, so it's signed with an identifier like the rest of Sparemac.
+    public static let adminToolName = "Sparemac Helper.app"
+    public static let adminToolIdentifier = helperLabel
+
+    /// The optional firewall keeping sessions off your local network: Apple's pfctl, started at every startup by
+    /// a launch daemon, with rules that list the sessions. No Sparemac code runs for it.
+    public static let firewallLabel = "dev.sparemac.firewall"
+    public static let firewallPlist = "/Library/LaunchDaemons/\(firewallLabel).plist"
+    public static let firewallScript = "\(supportDirectory)/firewall.sh"
+    public static let firewallRules = "\(supportDirectory)/firewall.rules"
+    /// Which rules are on (root-owned, so only the admin tool changes them): sessions off the local network, and
+    /// Screen Sharing answering only this Mac.
+    public static let firewallSessionsMarker = "\(supportDirectory)/firewall-sessions"
+    public static let firewallScreenSharingMarker = "\(supportDirectory)/firewall-screen-sharing"
+
+    /// What earlier versions installed, removed by install and uninstall: the helper that ran as root all the
+    /// time, and Sparemac Tools copied out of the app.
+    public enum Legacy {
+        public static let helperApp = "/Library/PrivilegedHelperTools/Sparemac Helper.app"
+        public static let helperPlist = "/Library/LaunchDaemons/dev.sparemac.helper.plist"
+        public static let agentApp = "/Library/Application Support/Sparemac/Sparemac Tools.app"
+        public static let oldAgentApp = "/Library/Application Support/Sparemac/SparemacAgent.app"
+    }
 
     /// The app's own socket, which the command and MCP server use (same user only).
     public static var appSocketPath: String {
@@ -144,5 +175,60 @@ public enum AppLink {
         guard fd >= 0 else { return nil }
         guard withUnixAddress(Sparemac.appSocketPath, { Darwin.connect(fd, $0, $1) }) == 0 else { close(fd); return nil }
         return Line(fd).call(request)
+    }
+}
+
+/// The sessions' copy of Sparemac Tools: each build in a folder of its own under .builds, and "Sparemac Tools.app"
+/// a link to the current one. A Tools still running keeps its own folder, so its signature (which Sparemac checks
+/// before it talks to it) still matches its files until it restarts on the new build.
+public enum ToolsCopy {
+    public static var builds: String { "\(Sparemac.agentToolsDirectory)/.builds" }
+
+    /// A bundle's build number, read from its Info.plist each time (Bundle keeps the first one it read).
+    public static func build(of bundle: String) -> String? {
+        NSDictionary(contentsOfFile: bundle + "/Contents/Info.plist")?["CFBundleVersion"] as? String
+    }
+
+    /// Copies `source` in when this build isn't there yet, and points the link at it. Answers whether the link
+    /// moved. `folder` makes a folder it may write in (the admin tool checks who owns it); `staging` is where a
+    /// copy is made before it's moved into place, and `ready` checks and hands over a staged copy.
+    public static func place(_ source: String, folder: (String) throws -> Void = { try FileManager.default.createDirectory(atPath: $0, withIntermediateDirectories: true) },
+                             staging: String? = nil, ready: (String) throws -> Void = { _ in }) throws -> Bool {
+        guard let build = build(of: source), !build.isEmpty, build.allSatisfy(\.isNumber) else { throw Failure("Sparemac Tools has no build number") }
+        let fm = FileManager.default
+        let name = Sparemac.agentBundleName, link = Sparemac.agentApp
+        let relative = ".builds/\(build)/\(name)"
+        if (try? fm.destinationOfSymbolicLink(atPath: link)) == relative, fm.fileExists(atPath: "\(builds)/\(build)/\(name)") { return false }
+        try folder(Sparemac.agentToolsDirectory)
+        try folder(builds)
+        prune(keeping: build)
+        let target = "\(builds)/\(build)"
+        if !fm.fileExists(atPath: "\(target)/\(name)") {
+            let stage = staging ?? "\(builds)/.staging-\(UUID().uuidString.prefix(8))"
+            try fm.createDirectory(atPath: stage, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(atPath: stage) }
+            guard run("/usr/bin/ditto", [source, "\(stage)/\(name)"]).status == 0 else { throw Failure("couldn't copy Sparemac Tools") }
+            try ready("\(stage)/\(name)")
+            try? fm.removeItem(atPath: target)
+            try folder(target)
+            guard rename("\(stage)/\(name)", "\(target)/\(name)") == 0 else { throw Failure("couldn't put Sparemac Tools in place") }
+        }
+        // A folder from before builds had folders of their own goes aside: a link can't take a folder's place.
+        if (try? fm.attributesOfItem(atPath: link))?[.type] as? FileAttributeType == .typeDirectory {
+            try? fm.moveItem(atPath: link, toPath: "\(builds)/.old-\(UUID().uuidString.prefix(8))")
+        }
+        let temp = "\(Sparemac.agentToolsDirectory)/.link-\(UUID().uuidString.prefix(8))"
+        try fm.createSymbolicLink(atPath: temp, withDestinationPath: relative)
+        guard rename(temp, link) == 0 else { try? fm.removeItem(atPath: temp); throw Failure("couldn't switch Sparemac Tools to build \(build)") }
+        return true
+    }
+
+    /// Keeps `current` and the newest build before it (a session may run it until it restarts); the rest goes.
+    static func prune(keeping current: String) {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: builds)) ?? []
+        let older = names.filter { $0.allSatisfy(\.isNumber) && $0 != current }.sorted().dropLast(1)
+        for name in Array(older) + names.filter({ $0.hasPrefix(".old-") || $0.hasPrefix(".staging-") }) {
+            try? FileManager.default.removeItem(atPath: "\(builds)/\(name)")
+        }
     }
 }

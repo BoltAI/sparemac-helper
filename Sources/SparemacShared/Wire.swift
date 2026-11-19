@@ -1,18 +1,61 @@
 import Foundation
+import Security
 
 /// Where the in-account agents listen, and how messages travel: one JSON object per line.
 public enum Wire {
-    public static let runDirectory = "/Users/Shared/Sparemac/run"
-    public static func socketPath(for user: String) -> String { "\(runDirectory)/\(user).sock" }
+    /// Root-owned; each session has a folder of its own inside, which only that session can write to, so no
+    /// account can take another's socket.
+    public static let runDirectory = "/Library/Application Support/Sparemac/run"
+    public static func folder(for user: String) -> String { "\(runDirectory)/\(user)" }
+    public static func socketPath(for user: String) -> String { "\(folder(for: user))/tools.sock" }
 
-    /// Connects to an agent account's socket. Returns nil if nothing is listening.
+    /// Connects to an agent account's socket. Returns nil if nothing is listening, or if what's listening isn't
+    /// that account's own Sparemac Tools: nothing (a password above all) goes to anything else.
     public static func connect(to user: String) -> Line? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         let ok = withUnixAddress(socketPath(for: user)) { Darwin.connect(fd, $0, $1) } == 0
-        if !ok { close(fd); return nil }
+        guard ok, peerIsTools(fd, of: user) else { close(fd); return nil }
         return Line(fd)
     }
+
+    /// Asks the session's Sparemac Tools to restart, without checking its signature: for a Tools whose files
+    /// changed under it, whose signature no longer checks out. A restart carries nothing a stranger could use.
+    @discardableResult
+    public static func restartUnchecked(_ user: String) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        var uid: uid_t = 0, gid: gid_t = 0
+        guard withUnixAddress(socketPath(for: user), { Darwin.connect(fd, $0, $1) }) == 0,
+              getpeereid(fd, &uid, &gid) == 0, uid == Accounts.uid(of: user) else { close(fd); return false }
+        return Line(fd).call(["cmd": "restart", "origin": "user"]) != nil
+    }
+
+    /// The process at the other end runs as `user` and is Sparemac Tools, signed by the same team as this one.
+    static func peerIsTools(_ fd: Int32, of user: String) -> Bool {
+        var uid: uid_t = 0, gid: gid_t = 0
+        guard getpeereid(fd, &uid, &gid) == 0, let expected = Accounts.uid(of: user), uid == expected else { return false }
+        guard let team = ownTeam else { return true }  // an unsigned build of our own, while developing
+        var token = audit_token_t()
+        var length = socklen_t(MemoryLayout<audit_token_t>.size)
+        guard getsockopt(fd, SOL_LOCAL, 6 /* LOCAL_PEERTOKEN */, &token, &length) == 0 else { return false }
+        let data = withUnsafeBytes(of: &token) { Data($0) }
+        var code: SecCode?, requirement: SecRequirement?
+        guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributeAudit: data] as CFDictionary, [], &code) == errSecSuccess, let code,
+              SecRequirementCreateWithString("anchor apple generic and certificate leaf[subject.OU] = \"\(team)\" and identifier \"\(Sparemac.agentLabel)\"" as CFString, [], &requirement) == errSecSuccess
+        else { return false }
+        return SecCodeCheckValidity(code, [], requirement) == errSecSuccess
+    }
+
+    /// The team that signed this program, read from its own signature once.
+    static let ownTeam: String? = {
+        var code: SecCode?, staticCode: SecStaticCode?, info: CFDictionary?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+              SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+              SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let dict = info as? [String: Any] else { return nil }
+        return dict[kSecCodeInfoTeamIdentifier as String] as? String
+    }()
 }
 
 /// Calls `body` with a sockaddr_un for `path`.
