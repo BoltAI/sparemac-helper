@@ -4,6 +4,8 @@ import os
 import Security
 import SparemacShared
 
+signal(SIGPIPE, SIG_IGN) // a closed pipe to the app fails the write instead of killing the helper
+
 // SparemacHelper: Sparemac's admin tool. Nothing installs it and nothing keeps it running: the app runs it, as
 // root, only after you type your password in macOS's prompt, for the one change you asked for (creating or
 // deleting a session, the firewall, uninstalling), and it exits. The app first copies it to a folder only
