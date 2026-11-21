@@ -1,4 +1,5 @@
 import Foundation
+import IOKit
 
 /// Names, paths and small system helpers shared by the app, the helper, the command and the agent.
 public enum Sparemac {
@@ -115,11 +116,14 @@ public enum Accounts {
         public let onConsole: Bool
     }
 
-    /// GUI sessions on this Mac, from the window server's own list.
+    /// GUI sessions on this Mac, from the window server's own list (the IO registry root's IOConsoleUsers), read
+    /// in-process: the app asks every 2 s, and launching ioreg for it cost a steady few percent of CPU.
     public static func sessions() -> [Session] {
-        let data = Data(run("/usr/sbin/ioreg", ["-n", "Root", "-d1", "-a"]).output.utf8)
-        guard let root = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any],
-              let users = root["IOConsoleUsers"] as? [[String: Any]] else { return [] }
+        let root = IORegistryGetRootEntry(kIOMainPortDefault)
+        defer { IOObjectRelease(root) }
+        guard root != 0,
+              let value = IORegistryEntryCreateCFProperty(root, "IOConsoleUsers" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue(),
+              let users = value as? [[String: Any]] else { return [] }
         return users.compactMap { entry in
             guard let name = entry["kCGSSessionUserNameKey"] as? String else { return nil }
             return Session(user: name, onConsole: entry["kCGSSessionOnConsoleKey"] as? Bool ?? false)
@@ -159,9 +163,11 @@ public enum Accounts {
 /// Talks to the in-account agent of an account.
 public enum Agent {
     /// Sends one request and returns the reply, or throws the agent's error.
-    public static func call(_ account: String, _ request: [String: Any]) throws -> [String: Any] {
+    /// `timeout`: seconds to wait for the reply (nil waits as long as the request takes, for long actions).
+    public static func call(_ account: String, _ request: [String: Any], timeout: Double? = nil) throws -> [String: Any] {
         guard Accounts.hasSession(account) else { throw Failure("\(account) is signed out") }
         guard let line = Wire.connect(to: account) else { throw Failure("Sparemac Tools isn't running in \(account) yet") }
+        if let timeout { line.setReadTimeout(timeout) }
         guard let reply = line.call(request) else { throw Failure("no reply from \(account)") }
         guard reply["ok"] as? Bool == true else { throw Failure(reply["error"] as? String ?? "failed") }
         return reply

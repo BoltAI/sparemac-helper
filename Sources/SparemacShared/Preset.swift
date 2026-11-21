@@ -2,7 +2,7 @@ import Foundation
 
 /// A saved setup for a session's screen, for clean screenshots and recordings: appearance, wallpaper, the Dock
 /// around the app being shown, a clean desktop, no notifications, and that app's window in the middle. The
-/// Sparemac app keeps them (Settings › Screen Setups); AI agents apply one with sparemac_preset and put it back after.
+/// Sparemac app keeps them (Settings › Studio Mode); AI agents apply one with sparemac_preset and put it back after.
 public struct Preset: Codable, Identifiable, Equatable, Sendable {
     public var id: String
     public var name: String

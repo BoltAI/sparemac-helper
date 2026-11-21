@@ -35,17 +35,32 @@ public enum Wire {
     static func peerIsTools(_ fd: Int32, of user: String) -> Bool {
         var uid: uid_t = 0, gid: gid_t = 0
         guard getpeereid(fd, &uid, &gid) == 0, let expected = Accounts.uid(of: user), uid == expected else { return false }
-        guard let team = ownTeam else { return true }  // an unsigned build of our own, while developing
+        guard ownTeam != nil, let requirement = toolsRequirement else { return true }  // an unsigned build of our own, while developing
         var token = audit_token_t()
         var length = socklen_t(MemoryLayout<audit_token_t>.size)
         guard getsockopt(fd, SOL_LOCAL, 6 /* LOCAL_PEERTOKEN */, &token, &length) == 0 else { return false }
+        // A process that passed once keeps passing: the app connects every 2 s, and checking the signature each time
+        // cost steady CPU. Keyed by pid and pid version (val[5], val[7]), so another process given the same pid is
+        // checked again.
+        let key = UInt64(UInt32(bitPattern: Int32(token.val.5))) << 32 | UInt64(token.val.7)
+        if verifiedLock.withLock({ verified.contains(key) }) { return true }
         let data = withUnsafeBytes(of: &token) { Data($0) }
-        var code: SecCode?, requirement: SecRequirement?
+        var code: SecCode?
         guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributeAudit: data] as CFDictionary, [], &code) == errSecSuccess, let code,
-              SecRequirementCreateWithString("anchor apple generic and certificate leaf[subject.OU] = \"\(team)\" and identifier \"\(Sparemac.agentLabel)\"" as CFString, [], &requirement) == errSecSuccess
-        else { return false }
-        return SecCodeCheckValidity(code, [], requirement) == errSecSuccess
+              SecCodeCheckValidity(code, [], requirement) == errSecSuccess else { return false }
+        verifiedLock.withLock { if verified.count > 64 { verified.removeAll() }; verified.insert(key) }
+        return true
     }
+
+    /// Sparemac Tools signed by this program's team, made once.
+    nonisolated(unsafe) static let toolsRequirement: SecRequirement? = {
+        guard let team = ownTeam else { return nil }
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithString("anchor apple generic and certificate leaf[subject.OU] = \"\(team)\" and identifier \"\(Sparemac.agentLabel)\"" as CFString, [], &requirement) == errSecSuccess else { return nil }
+        return requirement
+    }()
+    nonisolated(unsafe) private static var verified = Set<UInt64>()
+    private static let verifiedLock = NSLock()
 
     /// The team that signed this program, read from its own signature once.
     static let ownTeam: String? = {
